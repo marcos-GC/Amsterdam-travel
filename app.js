@@ -97,8 +97,54 @@ const gmPlace = p => p.lat && !p.address ? `https://www.google.com/maps/search/?
 const gmGo = p => "https://www.google.com/maps/dir/?api=1&destination=" + (p.address ? gq(p) : `${p.lat},${p.lng}`) + "&travelmode=bicycling";
 const placeById = id => S?.places.find(p => p.id === id);
 
+/* ---------- Rutas en bici y tiempo ---------- */
+const routeMem = store.get("routes", {});
+function dayPoints(d) {
+  const pts = [];
+  daySteps(d).forEach(s => { const p = placeById(s.place_id); if (!p || s.minor || p.lat == null) return; const ll = [p.lat, p.lng]; const last = pts[pts.length - 1]; if (!last || last[0] !== ll[0] || last[1] !== ll[1]) pts.push(ll); });
+  return pts;
+}
+async function getRoute(points) {
+  if (points.length < 2) return null;
+  const key = points.map(p => p[0].toFixed(5) + "," + p[1].toFixed(5)).join(";");
+  if (routeMem[key]) return routeMem[key];
+  const r = await api("route", { points });
+  routeMem[key] = r;
+  const keys = Object.keys(routeMem); if (keys.length > 30) delete routeMem[keys[0]];
+  store.set("routes", routeMem);
+  return r;
+}
+const kmTxt = m => (m / 1000).toFixed(1).replace(".", ",") + " km";
+const minTxt = s => { const m = Math.max(1, Math.round(s / 60)); return m < 60 ? m + " min" : Math.floor(m / 60) + " h " + String(m % 60).padStart(2, "0") + " min"; };
+function haversine(a, b) { const R = 6371e3, r = x => x * Math.PI / 180; const dLa = r(b[0] - a[0]), dLn = r(b[1] - a[1]); const h = Math.sin(dLa / 2) ** 2 + Math.cos(r(a[0])) * Math.cos(r(b[0])) * Math.sin(dLn / 2) ** 2; return 2 * R * Math.asin(Math.sqrt(h)); }
+
+let W = store.get("weather", null);
+async function loadWeather() {
+  if (W && Date.now() - W.at < 2 * 3600e3) return;
+  try { const w = await api("weather"); W = { at: Date.now(), w }; store.set("weather", W); if (curTab === "ruta") renderRuta(); } catch { }
+}
+const WCODE = c => c == null ? "" : c === 0 ? "Despejado" : c <= 2 ? "Algo nuboso" : c === 3 ? "Nublado" : c <= 48 ? "Niebla" : c <= 57 ? "Llovizna" : c <= 67 ? "Lluvia" : c <= 77 ? "Nieve" : c <= 82 ? "Chubascos" : c <= 86 ? "Nieve" : "Tormenta";
+function weatherHtml(D) {
+  if (!W?.w?.hourly) return "";
+  const h = W.w.hourly, dd = W.w.daily; const di = dd.time.indexOf(D.date); if (di < 0) return "";
+  const cells = [];
+  h.time.forEach((t, i) => { if (!t.startsWith(D.date)) return; const hr = +t.slice(11, 13); if (hr < 10 || hr > 20 || hr % 2) return;
+    const p = h.precipitation_probability[i] ?? 0;
+    cells.push(`<div class="wh"><span>${hr}h</span><b>${Math.round(h.temperature_2m[i])}°</b><i style="--p:${p}%"></i><small>${p}%</small></div>`); });
+  const sunset = (dd.sunset[di] || "").slice(11, 16);
+  return `<div class="weather" aria-label="Previsión del tiempo"><div class="wtop"><span><b>${Math.round(dd.temperature_2m_min[di])}–${Math.round(dd.temperature_2m_max[di])}°</b> · ${dd.precipitation_sum[di] > 0.2 ? dd.precipitation_sum[di].toFixed(1).replace(".", ",") + " mm de lluvia" : "sin lluvia apreciable"}</span><span>Puesta de sol ${sunset}</span></div><div class="whours">${cells.join("")}</div><div class="small">Probabilidad de lluvia por horas · Open-Meteo</div></div>`;
+}
+
 /* ---------- Ruta ---------- */
 function daySteps(d) { return S.steps.filter(s => s.day === d).sort((a, b) => toMin(a.time) - toMin(b.time)); }
+function nextStopHtml(D) {
+  const n = nowAms(); if (n.date !== D.date) return "";
+  const st = daySteps(D.id).filter(s => !s.minor && s.place_id);
+  const nx = st.find(s => toMin(s.time) >= n.min - 20); if (!nx) return "";
+  const p = placeById(nx.place_id); if (!p) return "";
+  const dist = meLL && p.lat != null ? " · a " + kmTxt(haversine(meLL, [p.lat, p.lng]) * 1.3) + " aprox." : "";
+  return `<div class="nextstop"><div><span class="small">Siguiente · ${esc(nx.time)}${dist}</span><b>${esc(nx.title)}</b></div><a class="btn primary" href="${gmGo(p)}" target="_blank" rel="noopener">${ico.go}Ir</a></div>`;
+}
 function renderRuta() {
   if (!S) return;
   if (!curDay) { const d = nowAms().date; curDay = (S.days.find(x => x.date === d) || {}).id || store.get("day", S.days[0]?.id); }
@@ -114,12 +160,15 @@ function renderRuta() {
     return `<li class="step${s.minor ? " minor" : ""}" data-t="${esc(s.time)}"><div class="t">${esc(s.time)}</div>${dot}<div class="body">${ride}<h3>${esc(s.title)}</h3>${s.note ? `<div class="sub">${esc(s.note)}</div>` : ""}${acts}<button class="iconbtn edit" type="button" data-editstep="${s.id}" aria-label="Editar parada">${ico.edit}</button></div></li>`;
   }).join("");
   const legs = (D.legs || []).map((l, i) => `<a href="https://www.google.com/maps/dir/?api=1&${l.query}" target="_blank" rel="noopener"><span>${esc(l.label)}</span><b>Tramo ${i + 1} ↗</b></a>`).join("");
-  $("#day").innerHTML = `<div class="dayhead"><h2>${esc(D.title)}</h2>${D.sub ? `<p>${esc(D.sub)}</p>` : ""}<div class="meta">${D.km ? `<span class="pill">${esc(D.km)}</span>` : ""}${D.light ? `<span class="pill warn">${esc(D.light)}</span>` : ""}</div></div>
+  $("#day").innerHTML = `${nextStopHtml(D)}<div class="dayhead"><h2>${esc(D.title)}</h2>${D.sub ? `<p>${esc(D.sub)}</p>` : ""}<div class="meta"><span class="pill" id="dayKm">${esc(D.km || "")}</span>${D.light ? `<span class="pill warn">${esc(D.light)}</span>` : ""}</div></div>
+   ${weatherHtml(D)}
    <ol class="timeline">${steps}</ol>
    <div class="addrow"><button class="btn" type="button" id="addStep">${ico.plus}Añadir parada</button></div>
    ${legs ? `<section class="block"><h3 class="label">Ruta completa en Google Maps</h3><div class="legs">${legs}</div></section>` : ""}
    ${D.note ? `<div class="note">${esc(D.note)}</div>` : ""}`;
   markNow();
+  const pts = dayPoints(curDay), forDay = curDay;
+  getRoute(pts).then(r => { if (r && forDay === curDay && $("#dayKm")) $("#dayKm").textContent = "Ruta en bici: " + kmTxt(r.distance) + " · " + minTxt(r.duration); }).catch(() => { });
 }
 function markNow() {
   if (!S) return;
@@ -241,8 +290,43 @@ function drawMarkers() {
     m.addTo(map); markers[p.id] = m;
   });
   pts = pts.filter((p, i) => !i || p[0] !== pts[i - 1][0] || p[1] !== pts[i - 1][1]);
-  if (pts.length > 1) routeLine = L.polyline(pts, { color: getComputedStyle(document.documentElement).getPropertyValue("--fiets").trim() || "#B83A2C", weight: 4, opacity: .75, dashArray: "2 8", lineCap: "round" }).addTo(map);
+  $("#routeInfo").hidden = true;
+  if (pts.length > 1) {
+    const red = getComputedStyle(document.documentElement).getPropertyValue("--fiets").trim() || "#B83A2C";
+    // Mientras llega la ruta real se ve una línea discontinua recta.
+    routeLine = L.polyline(pts, { color: red, weight: 3, opacity: .6, dashArray: "2 8", lineCap: "round" }).addTo(map);
+    const forFilter = mapFilter;
+    getRoute(pts).then(r => {
+      if (!r || forFilter !== mapFilter || !map) return;
+      if (routeLine) routeLine.remove();
+      routeLine = L.layerGroup([
+        L.polyline(r.geometry, { color: "#fff", weight: 8, opacity: .85 }),
+        L.polyline(r.geometry, { color: red, weight: 5, opacity: .95 }),
+      ]).addTo(map);
+      Object.values(markers).forEach(m => m.setZIndexOffset(100));
+      $("#routeInfo").innerHTML = `<b>${kmTxt(r.distance)}</b> · ${minTxt(r.duration)} pedaleando`;
+      $("#routeInfo").hidden = false;
+    }).catch(() => { });
+  }
   if (meLL) showMe(meLL, false);
+  if (meRoute) meRoute.addTo(map);
+}
+let meRoute = null;
+async function routeFromMe(p) {
+  const run = async () => {
+    try {
+      const r = await getRoute([meLL, [p.lat, p.lng]]);
+      if (meRoute) meRoute.remove();
+      meRoute = L.layerGroup([L.polyline(r.geometry, { color: "#fff", weight: 8, opacity: .85 }), L.polyline(r.geometry, { color: "#2F80ED", weight: 5 })]).addTo(map);
+      map.fitBounds(L.latLngBounds(r.geometry), { padding: [70, 50] });
+      $("#routeInfo").innerHTML = `Hasta <b>${esc(p.name)}</b>: <b>${kmTxt(r.distance)}</b> · ${minTxt(r.duration)} <button type="button" class="linkbtn" id="clearMeRoute">Quitar</button>`;
+      $("#routeInfo").hidden = false;
+      $("#clearMeRoute").onclick = () => { meRoute.remove(); meRoute = null; drawMarkers(); };
+    } catch (e) { toast("No se pudo calcular la ruta: " + e.message, 4000); }
+  };
+  if (meLL) return run();
+  toast("Buscando tu ubicación…");
+  startLocate(() => run());
 }
 function fit() { const ll = Object.values(markers).map(m => m.getLatLng()); if (ll.length) map.fitBounds(L.latLngBounds(ll), { padding: [60, 40], maxZoom: 15 }); }
 function select(id, pan) {
@@ -255,10 +339,11 @@ function select(id, pan) {
    <div class="kind" style="color:${col(p.type)}">${TYPES[p.type] || "Otro"}${p.days.length ? " · " + p.days.map(d => DAYN[d] || d).join(", ") : ""}${inSteps.length ? " · Ruta " + inSteps.join(", ") : ""}</div>
    <h3>${esc(p.name)}</h3>${p.address ? `<div class="addr">${esc(p.address)}</div>` : ""}${p.notes ? `<div class="notes">${esc(p.notes)}</div>` : ""}
    <div class="actions"><a class="btn primary" href="${gmGo(p)}" target="_blank" rel="noopener">${ico.go}Ir en bici</a><a class="btn" href="${gmPlace(p)}" target="_blank" rel="noopener">${ico.pin}Google Maps</a></div>
-   <div class="actions"><button class="btn" type="button" data-a="edit">${ico.edit}Editar</button><button class="btn" type="button" data-a="move">${ico.move}Mover</button><button class="btn" type="button" data-a="ask">${ico.ask}Preguntar</button></div>`;
+   <div class="actions"><button class="btn" type="button" data-a="route">${ico.go}Ruta desde aquí</button><button class="btn" type="button" data-a="edit">${ico.edit}Editar</button><button class="btn" type="button" data-a="move">${ico.move}Mover</button><button class="btn" type="button" data-a="ask">${ico.ask}Preguntar</button></div>`;
   c.hidden = false;
   $(".close", c).onclick = () => select(null);
   $("[data-a=edit]", c).onclick = () => placeEditor(p);
+  $("[data-a=route]", c).onclick = () => { c.hidden = true; routeFromMe(p); };
   $("[data-a=move]", c).onclick = () => { dragId = p.id; c.hidden = true; drawMarkers(); $("#mapHint").textContent = "Arrastra el punto a su sitio"; $("#mapHint").hidden = false; };
   $("[data-a=ask]", c).onclick = () => { go("claude"); $("#msg").value = `Sobre ${p.name}: `; $("#msg").focus(); };
   if (pan) { if (!markers[id]) { mapFilter = "all"; drawMarkers(); } map.setView([p.lat, p.lng], Math.max(map.getZoom(), 15), { animate: true }); }
@@ -271,16 +356,17 @@ function showMe(ll, pan) {
   meMarker.setLatLng(ll).addTo(map);
   if (pan) map.setView(ll, Math.max(map.getZoom(), 15));
 }
-$("#locBtn").onclick = () => {
+function startLocate(onFirst) {
   if (!navigator.geolocation) { toast("Este móvil no da la ubicación al navegador."); return; }
-  if (meLL && watchId != null) { showMe(meLL, true); return; }
+  if (watchId != null) { if (meLL) { showMe(meLL, true); onFirst && onFirst(); } return; }
   $("#locBtn").classList.add("on");
   let first = true;
   watchId = navigator.geolocation.watchPosition(pos => {
     meLL = [pos.coords.latitude, pos.coords.longitude]; store.set("lastLoc", meLL);
-    showMe(meLL, first); first = false;
+    showMe(meLL, first && !onFirst); if (first && onFirst) onFirst(); first = false;
   }, err => { $("#locBtn").classList.remove("on"); watchId = null; toast(err.code === 1 ? "Sin permiso de ubicación. Actívalo en los ajustes del navegador." : "No se pudo obtener la ubicación."); }, { enableHighAccuracy: true, maximumAge: 15000 });
-};
+}
+$("#locBtn").onclick = () => startLocate();
 
 /* ---------- Claude ---------- */
 let attached = [];
@@ -471,6 +557,7 @@ function start() {
   if (S) renderAll();
   show(location.hash.slice(1) || "ruta");
   refresh(false);
+  loadWeather(); setInterval(loadWeather, 30 * 60e3);
   // Sincroniza con el otro móvil cada 20 s mientras la app está a la vista y no se está editando.
   setInterval(() => { if (document.visibilityState === "visible" && $("#sheet").hidden && !busy && !dragId) refresh(); }, 20000);
   document.addEventListener("visibilitychange", () => { if (document.visibilityState === "visible") refresh(); });

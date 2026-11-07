@@ -1,12 +1,23 @@
 // API de la guía de Ámsterdam: datos compartidos, documentos y chat con Claude.
-// Todas las peticiones llevan la cabecera x-trip-code, que se compara con el secreto TRIP_CODE.
+// Todas las peticiones llevan la cabecera x-trip-code, que se compara con trip_code (secreto TRIP_CODE o tabla app_config).
 import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 import { createClient } from "npm:@supabase/supabase-js@2.45.4";
 import Anthropic from "npm:@anthropic-ai/sdk@1.3.0";
 
 const db = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
-const TRIP_CODE = Deno.env.get("TRIP_CODE") ?? "";
-const MODEL = "claude-opus-5-5";
+const MODEL = "claude-sonnet-5-5";
+
+// Configuración: primero los secretos de la función; si no están, la tabla app_config.
+let cfgCache: { at: number; data: Record<string, string> } | null = null;
+async function config(key: string): Promise<string> {
+  const env = Deno.env.get(key.toUpperCase());
+  if (env) return env;
+  if (!cfgCache || Date.now() - cfgCache.at > 60_000) {
+    const { data } = await db.from("app_config").select("key,value");
+    cfgCache = { at: Date.now(), data: Object.fromEntries((data ?? []).map((r: { key: string; value: string }) => [r.key, r.value])) };
+  }
+  return cfgCache.data[key] ?? "";
+}
 const TYPES = ["ver", "comer", "diseno", "bici", "base", "ferri", "otro"];
 
 const cors = {
@@ -64,6 +75,47 @@ async function geocode(q: string) {
   if (!r.ok) throw new Error("El buscador de direcciones no responde (" + r.status + ")");
   const list = await r.json();
   return (list as { lat: string; lon: string; display_name: string }[]).map((x) => ({ lat: +x.lat, lng: +x.lon, label: x.display_name }));
+}
+
+// ---------- Rutas en bici (OSRM, perfil bici de routing.openstreetmap.de) ----------
+type LL = [number, number];
+async function cached<T>(key: string, maxAgeMs: number, fn: () => Promise<T>): Promise<T> {
+  const { data } = await db.from("route_cache").select("data,created_at").eq("key", key).maybeSingle();
+  if (data && Date.now() - new Date(data.created_at).getTime() < maxAgeMs) return data.data as T;
+  const fresh = await fn();
+  await db.from("route_cache").upsert({ key, data: fresh, created_at: new Date().toISOString() });
+  return fresh;
+}
+async function bikeRoute(points: LL[]) {
+  const pts = points.filter((p, i) => Array.isArray(p) && isFinite(p[0]) && isFinite(p[1]) && (!i || p[0] !== points[i - 1][0] || p[1] !== points[i - 1][1])).slice(0, 25);
+  if (pts.length < 2) throw new Error("Hacen falta al menos dos puntos con ubicación");
+  const coords = pts.map(([la, ln]) => `${ln.toFixed(5)},${la.toFixed(5)}`).join(";");
+  return await cached("route:" + coords, 30 * 864e5, async () => {
+    const r = await fetch(`https://routing.openstreetmap.de/routed-bike/route/v1/driving/${coords}?overview=full&geometries=geojson&steps=false`, { headers: { "User-Agent": "amsterdam-travel-guide/1.0 (personal trip app)" } });
+    if (!r.ok) throw new Error("El servicio de rutas no responde (" + r.status + ")");
+    const j = await r.json();
+    if (j.code !== "Ok" || !j.routes?.length) throw new Error("No se ha encontrado ruta en bici");
+    const rt = j.routes[0];
+    return {
+      distance: Math.round(rt.distance), duration: Math.round(rt.duration),
+      legs: rt.legs.map((l: { distance: number; duration: number }) => ({ distance: Math.round(l.distance), duration: Math.round(l.duration) })),
+      geometry: (rt.geometry.coordinates as [number, number][]).map(([ln, la]) => [+la.toFixed(5), +ln.toFixed(5)]),
+    };
+  });
+}
+const fmtKm = (m: number) => (m / 1000).toFixed(1).replace(".", ",");
+const fmtMin = (s: number) => String(Math.max(1, Math.round(s / 60)));
+const toMinS = (t: string) => { const m = /^(\d{1,2}):(\d{2})/.exec(t || ""); return m ? +m[1] * 60 + +m[2] : 9999; };
+
+// ---------- Tiempo (Open-Meteo, sin clave) ----------
+async function weather() {
+  const hourKey = new Date().toISOString().slice(0, 13);
+  return await cached("weather:" + hourKey, 3 * 3600e3, async () => {
+    const u = "https://api.open-meteo.com/v1/forecast?latitude=52.37&longitude=4.89&hourly=temperature_2m,precipitation_probability,precipitation,wind_speed_10m,weather_code&daily=sunrise,sunset,temperature_2m_max,temperature_2m_min,precipitation_sum&timezone=Europe%2FAmsterdam&start_date=2026-11-07&end_date=2026-11-09&wind_speed_unit=kmh";
+    const r = await fetch(u);
+    if (!r.ok) throw new Error("El servicio del tiempo no responde (" + r.status + ")");
+    return await r.json();
+  });
 }
 
 async function savePlace(p: Record<string, unknown>, who: string) {
@@ -190,6 +242,19 @@ const TOOLS = [
     input_schema: { type: "object", properties: { id: { type: "string" }, label: { type: "string" }, done: { type: "boolean" } } },
   },
   { name: "buscar_direccion", description: "Busca una dirección o un lugar de Ámsterdam en OpenStreetMap y devuelve coordenadas.", input_schema: { type: "object", properties: { q: { type: "string" } }, required: ["q"] } },
+  {
+    name: "calcular_ruta",
+    description: "Calcula rutas reales en bici. Modo día: pasa 'day' para calcular los tramos entre las paradas de ese día en orden (con actualizar=true guarda km y minutos en cada parada). Modo punto a punto: pasa 'puntos' como lista de [lat,lng] (por ejemplo, la ubicación del viajero y un sitio). Los ferris del IJ entran en la ruta.",
+    input_schema: {
+      type: "object",
+      properties: {
+        day: { type: "string", enum: ["sab", "dom", "lun"] },
+        actualizar: { type: "boolean", description: "Solo en modo día: guarda km y min calculados en las paradas." },
+        puntos: { type: "array", items: { type: "array", items: { type: "number" } } },
+      },
+    },
+  },
+  { name: "consultar_tiempo", description: "Previsión por horas en Ámsterdam del 7 al 9 de noviembre: temperatura, probabilidad y cantidad de lluvia, viento, salida y puesta del sol.", input_schema: { type: "object", properties: { day: { type: "string", enum: ["sab", "dom", "lun"] } } } },
   { name: "leer_documento", description: "Lee un documento subido por los viajeros (PDF, imagen o texto) por su id.", input_schema: { type: "object", properties: { id: { type: "string" } }, required: ["id"] } },
 ];
 
@@ -200,6 +265,8 @@ Te escriben desde el móvil, a menudo dictando por voz mientras van en bici, as�
 Puedes cambiar la app con las herramientas: sitios del mapa, paradas del itinerario, días, fichas de información y pendientes. Cuando te pidan añadir, quitar o cambiar algo, hazlo directamente y después di en una frase qué has cambiado. Si una petición es ambigua y equivocarse costaría (por ejemplo, borrar varias paradas), pregunta antes. Al mover una parada a otra hora, revisa si hay que reajustar las siguientes y dilo.
 
 Usa la búsqueda web cuando necesites datos actuales (horarios, si algo abre hoy, precios, eventos) y di de dónde sale el dato. Si no puedes comprobar algo, dilo.
+
+Para distancias y tiempos en bici usa calcular_ruta en lugar de estimar; si añades o mueves paradas, recalcula los km y minutos de ese día con actualizar=true. Para el tiempo, usa consultar_tiempo. Si el mensaje trae la ubicación del viajero, úsala para «cómo llego», «qué hay cerca» o «cuánto me falta».
 
 Los datos actuales de la app van en el primer mensaje de cada conversación, entre etiquetas <datos_app>. Usa los ids que aparecen ahí. La hora local de Ámsterdam va en cada mensaje.`;
 
@@ -248,6 +315,40 @@ async function runTool(name: string, input: Record<string, unknown>, who: string
     }
     case "buscar_direccion":
       return await geocode(String(input.q));
+    case "calcular_ruta": {
+      if (Array.isArray(input.puntos)) {
+        const r = await bikeRoute(input.puntos as LL[]);
+        return { km: fmtKm(r.distance), min: fmtMin(r.duration), tramos: r.legs.map((l: { distance: number; duration: number }) => ({ km: fmtKm(l.distance), min: fmtMin(l.duration) })) };
+      }
+      const day = String(input.day ?? "");
+      const steps = (await must(db.from("steps").select("*").eq("day", day)) as { id: string; time: string; place_id: string | null; title: string; minor: boolean }[])
+        .sort((a, b) => toMinS(a.time) - toMinS(b.time));
+      const places = await must(db.from("places").select("id,lat,lng")) as { id: string; lat: number | null; lng: number | null }[];
+      const pm = new Map(places.map((p) => [p.id, p]));
+      const route = steps.filter((s) => !s.minor && s.place_id && pm.get(s.place_id)?.lat != null);
+      if (route.length < 2) throw new Error("Ese día no tiene al menos dos paradas con sitio en el mapa");
+      const r = await bikeRoute(route.map((s) => [pm.get(s.place_id!)!.lat!, pm.get(s.place_id!)!.lng!] as LL));
+      // Si dos paradas seguidas comparten sitio, OSRM no genera tramo entre ellas: se cuenta como 0.
+      const legs: { parada: string; km: string; min: string }[] = [];
+      let li = 0;
+      for (let i = 1; i < route.length; i++) {
+        const same = route[i].place_id === route[i - 1].place_id;
+        const leg = same ? { distance: 0, duration: 0 } : r.legs[li++] ?? { distance: 0, duration: 0 };
+        legs.push({ parada: route[i].title, km: fmtKm(leg.distance), min: fmtMin(leg.duration) });
+        if (input.actualizar && !same) await must(db.from("steps").update({ km: fmtKm(leg.distance), min: fmtMin(leg.duration), updated_by: "Claude (" + who + ")" }).eq("id", route[i].id));
+      }
+      if (input.actualizar) changes.push({ what: "Km y minutos recalculados: " + day });
+      return { total_km: fmtKm(r.distance), total_min: fmtMin(r.duration), tramos: legs };
+    }
+    case "consultar_tiempo": {
+      const w = await weather() as { hourly: Record<string, unknown[]>; daily: Record<string, unknown[]> };
+      const dates: Record<string, string> = { sab: "2026-11-07", dom: "2026-11-08", lun: "2026-11-09" };
+      const d = input.day ? dates[String(input.day)] : "";
+      const h = w.hourly as { time: string[]; temperature_2m: number[]; precipitation_probability: number[]; precipitation: number[]; wind_speed_10m: number[] };
+      const horas = h.time.map((t, i) => ({ t, temp: h.temperature_2m[i], lluvia_pct: h.precipitation_probability[i], lluvia_mm: h.precipitation[i], viento_kmh: h.wind_speed_10m[i] }))
+        .filter((x) => (!d || x.t.startsWith(d)) && +x.t.slice(11, 13) >= 8 && +x.t.slice(11, 13) <= 22);
+      return { diario: w.daily, horas };
+    }
     case "leer_documento":
       return [await docBlock(String(input.id))];
   }
@@ -259,8 +360,8 @@ function amsNow() {
 }
 
 async function chat(text: string, who: string, docIds: string[], loc: { lat: number; lng: number } | null) {
-  const apiKey = Deno.env.get("ANTHROPIC_API_KEY");
-  if (!apiKey) throw new Error("Falta la clave de la API de Anthropic en el servidor (secreto ANTHROPIC_API_KEY).");
+  const apiKey = await config("anthropic_api_key");
+  if (!apiKey) throw new Error("Claude aún no está conectado: falta guardar la clave de la API de Anthropic en Supabase (Edge Functions → Secrets → ANTHROPIC_API_KEY).");
   const client = new Anthropic({ apiKey });
 
   await must(db.from("messages").insert({ author: who, role: "user", content: text, meta: docIds.length ? { docs: docIds } : null }));
@@ -336,8 +437,9 @@ async function chat(text: string, who: string, docIds: string[], loc: { lat: num
 Deno.serve(async (req) => {
   if (req.method === "OPTIONS") return new Response("ok", { headers: cors });
   if (req.method !== "POST") return json({ error: "Método no permitido" }, 405);
-  if (!TRIP_CODE) return json({ error: "El servidor no tiene código de acceso configurado (secreto TRIP_CODE)." }, 500);
-  if (!safeEqual(req.headers.get("x-trip-code") ?? "", TRIP_CODE)) return json({ error: "Código incorrecto" }, 401);
+  const tripCode = await config("trip_code");
+  if (!tripCode) return json({ error: "El servidor no tiene código de acceso configurado (trip_code)." }, 500);
+  if (!safeEqual(req.headers.get("x-trip-code") ?? "", tripCode)) return json({ error: "Código incorrecto" }, 401);
 
   let body: Record<string, unknown>;
   try { body = await req.json(); } catch { return json({ error: "Petición no válida" }, 400); }
@@ -363,6 +465,8 @@ Deno.serve(async (req) => {
       }
       case "deleteCheck": await must(db.from("checks").delete().eq("id", String(body.id))); return json({ ok: true });
       case "geocode": return json(await geocode(String(body.q)));
+      case "route": return json(await bikeRoute(body.points as LL[]));
+      case "weather": return json(await weather());
       case "uploadUrl": {
         const name = String(body.name ?? "archivo").replace(/[^\w.\-]+/g, "_").slice(-80);
         const path = `${crypto.randomUUID()}/${name}`;

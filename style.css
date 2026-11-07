@@ -85,6 +85,22 @@ h3.label{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(
 .legs a b{font-family:var(--f-mono);font-size:12px;color:var(--fiets);flex:none}
 .note{background:var(--surface);border-left:4px solid var(--comer);border-radius:0 10px 10px 0;padding:10px 12px;font-size:14px;margin-top:14px}
 
+/* Siguiente parada y tiempo */
+.nextstop{display:flex;align-items:center;justify-content:space-between;gap:10px;background:var(--fiets);color:#fff;border-radius:14px;padding:10px 12px 10px 14px;margin-top:12px}
+.nextstop .small{color:rgba(255,255,255,.85);display:block}
+.nextstop b{font-size:17px;display:block;line-height:1.2}
+.nextstop .btn.primary{background:#fff;color:var(--fiets);border-color:#fff;flex:none}
+.weather{background:var(--surface);border:1px solid var(--line);border-radius:12px;padding:10px 12px;margin-top:12px}
+.wtop{display:flex;flex-wrap:wrap;justify-content:space-between;gap:4px 12px;font-size:14px}
+.whours{display:grid;grid-template-columns:repeat(6,1fr);gap:4px;margin:8px 0 4px}
+.wh{display:flex;flex-direction:column;align-items:center;gap:2px;font-size:12px}
+.wh span{color:var(--muted);font-family:var(--f-mono)}
+.wh b{font-size:15px}
+.wh i{display:block;width:100%;max-width:34px;height:5px;border-radius:3px;background:linear-gradient(90deg,var(--ver) var(--p),var(--chip) var(--p))}
+.wh small{color:var(--muted);font-family:var(--f-mono);font-size:11px}
+.routeinfo{position:absolute;z-index:520;top:54px;left:50%;transform:translateX(-50%);background:var(--surface);border:1px solid var(--line);border-radius:999px;padding:6px 14px;font-size:14px;box-shadow:0 1px 6px rgba(0,0,0,.2);white-space:nowrap;max-width:calc(100% - 20px);overflow:hidden;text-overflow:ellipsis}
+.linkbtn{border:0;background:transparent;color:var(--ver);font-weight:700;padding:0 0 0 6px;cursor:pointer}
+
 /* Mapa */
 #view-mapa{overflow:hidden}
 #map{position:absolute;inset:0;background:var(--bg)}
