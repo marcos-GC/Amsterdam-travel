@@ -49,6 +49,7 @@
     <section class="view chatview" id="view-claude" aria-label="Claude" hidden>
       <div class="chatlog" id="chatlog"></div>
       <div class="composer">
+        <div class="quick" id="quick" aria-label="Preguntas rápidas"></div>
         <div class="attached" id="attached" hidden></div>
         <div class="row">
           <button class="iconbtn round" id="attachBtn" type="button" aria-label="Adjuntar documento"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 11l-8.5 8.5a5 5 0 01-7-7L14 4a3.5 3.5 0 015 5l-8.5 8.5a2 2 0 01-3-3L15 7"/></svg></button>
@@ -57,7 +58,10 @@
           <button class="iconbtn round mic" id="micBtn" type="button" aria-label="Dictar"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0014 0M12 18v3"/></svg></button>
           <button class="iconbtn round send" id="sendBtn" type="button" aria-label="Enviar"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14M13 6l6 6-6 6"/></svg></button>
         </div>
-        <label class="autosend"><input type="checkbox" id="autoSend"> Enviar al terminar de dictar</label>
+        <div class="composerfoot">
+          <label class="autosend"><input type="checkbox" id="autoSend"> Enviar al terminar de dictar</label>
+          <button class="speakbtn" id="speakBtn" type="button" aria-pressed="false"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 10v4h4l5 4V6L8 10H4z"/><path d="M16 9a4 4 0 010 6M18.5 6.5a8 8 0 010 11"/></svg>Leer en voz alta</button>
+        </div>
       </div>
     </section>
 

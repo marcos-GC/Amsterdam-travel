@@ -48,9 +48,13 @@ function toast(t, ms = 2600) {
   el.textContent = t; el.hidden = false;
   clearTimeout(toast._t); toast._t = setTimeout(() => el.hidden = true, ms);
 }
+let refreshSeq = 0, appliedSeq = 0;
 async function refresh(quiet = true) {
+  const seq = ++refreshSeq;
   try {
     const s = await api("state");
+    if (seq < appliedSeq) return;
+    appliedSeq = seq;
     S = s; store.set("state", s); $("#offline").hidden = true;
     renderAll();
   } catch (e) {
@@ -155,11 +159,11 @@ function renderRuta() {
     const p = s.place_id && placeById(s.place_id);
     const num = s.minor ? "" : ++n;
     const ride = s.km ? `<div class="ride">${esc(s.km)} km · ${esc(s.min)} min en bici</div>` : "";
-    const acts = p && !s.minor ? `<div class="actions"><a class="btn primary" href="${gmGo(p)}" target="_blank" rel="noopener">${ico.go}Ir en bici</a><button class="btn" type="button" data-show="${esc(p.id)}">${ico.map}Mapa</button></div>` : "";
+    const acts = p && !s.minor ? `<div class="actions"><a class="btn primary" href="${gmGo(p)}" target="_blank" rel="noopener">${ico.go}Ir en bici</a>${p.lat != null ? `<button class="btn" type="button" data-show="${esc(p.id)}">${ico.map}Mapa</button>` : `<button class="btn" type="button" data-place="${esc(p.id)}">${ico.pin}Colocar en mapa</button>`}</div>` : "";
     const dot = s.minor ? `<span class="dot leg"></span>` : `<span class="dot" style="background:${p ? col(p.type) : "var(--muted)"}">${num}</span>`;
     return `<li class="step${s.minor ? " minor" : ""}" data-t="${esc(s.time)}"><div class="t">${esc(s.time)}</div>${dot}<div class="body">${ride}<h3>${esc(s.title)}</h3>${s.note ? `<div class="sub">${esc(s.note)}</div>` : ""}${acts}<button class="iconbtn edit" type="button" data-editstep="${s.id}" aria-label="Editar parada">${ico.edit}</button></div></li>`;
   }).join("");
-  const legs = (D.legs || []).map((l, i) => `<a href="https://www.google.com/maps/dir/?api=1&${l.query}" target="_blank" rel="noopener"><span>${esc(l.label)}</span><b>Tramo ${i + 1} ↗</b></a>`).join("");
+  const legs = (D.legs || []).map((l, i) => `<a href="https://www.google.com/maps/dir/?api=1&${esc(l.query)}" target="_blank" rel="noopener"><span>${esc(l.label)}</span><b>Tramo ${i + 1} ↗</b></a>`).join("");
   $("#day").innerHTML = `${nextStopHtml(D)}<div class="dayhead"><h2>${esc(D.title)}</h2>${D.sub ? `<p>${esc(D.sub)}</p>` : ""}<div class="meta"><span class="pill" id="dayKm">${esc(D.km || "")}</span>${D.light ? `<span class="pill warn">${esc(D.light)}</span>` : ""}</div></div>
    ${weatherHtml(D)}
    <ol class="timeline">${steps}</ol>
@@ -181,6 +185,7 @@ function markNow() {
 }
 $("#dayTabs").addEventListener("click", e => { const b = e.target.closest("[data-day]"); if (!b) return; curDay = b.dataset.day; store.set("day", curDay); renderRuta(); $("#view-ruta").scrollTop = 0; });
 $("#day").addEventListener("click", e => {
+  const pl = e.target.closest("[data-place]"); if (pl) { const p = placeById(pl.dataset.place); if (p) { go("mapa"); setTimeout(() => startMove(p), 150); } return; }
   const s = e.target.closest("[data-show]"); if (s) { mapFilter = curDay; go("mapa"); setTimeout(() => select(s.dataset.show, true), 80); return; }
   const ed = e.target.closest("[data-editstep]"); if (ed) { stepEditor(S.steps.find(x => x.id === ed.dataset.editstep)); return; }
   if (e.target.closest("#addStep")) stepEditor({ day: curDay, time: "", title: "", km: "", min: "", note: "", minor: false, place_id: null });
@@ -200,7 +205,7 @@ function confirmBtn(btn, label, fn) {
 }
 
 function placeOptions(sel) {
-  const ps = [...S.places].sort((a, b) => a.name.localeCompare(b.name, "es"));
+  const ps = [...S.places].sort((a, b) => (a.name || "").localeCompare(b.name || "", "es"));
   return `<option value="">— Sin sitio —</option>` + ps.map(p => `<option value="${esc(p.id)}"${p.id === sel ? " selected" : ""}>${esc(p.name)}</option>`).join("");
 }
 function stepEditor(s) {
@@ -258,7 +263,7 @@ function placeEditor(p) {
     if (geo) { place.lat = geo.lat; place.lng = geo.lng; }
     closeSheet();
     const r = await act("savePlace", { place }, "Sitio guardado");
-    if (r?.lat == null) toast("Guardado sin ubicación: ábrelo en el mapa y usa «Mover» para colocarlo.", 5000);
+    if (r && r.lat == null) { toast("No encontré la dirección: arrastra el punto a su sitio en el mapa.", 5000); go("mapa"); setTimeout(() => startMove(r), 200); }
     else if (curTab === "mapa") setTimeout(() => select(r.id, true), 200);
   };
 }
@@ -267,14 +272,23 @@ function placeEditor(p) {
 let map, markers = {}, routeLine, mapFilter = "all", selId = null, meMarker = null, meLL = store.get("lastLoc", null), watchId = null, dragId = null;
 function initMap() {
   map = L.map("map", { zoomControl: false }).setView([52.368, 4.895], 13);
-  L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 19, attribution: '© <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a>' }).addTo(map);
-  map.on("click", () => { if (!dragId) select(null); });
+  L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 19, crossOrigin: true, attribution: '© <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a>' }).addTo(map);
+  map.on("click", () => { if (dragId) cancelMove(); else select(null); });
   map.on("contextmenu", e => { if (dragId) return; placeEditor({ name: "", address: "", type: "ver", days: curDay ? [curDay] : [], notes: "", lat: e.latlng.lat, lng: e.latlng.lng }); });
   $("#legend").innerHTML = Object.entries(TYPES).filter(([k]) => k !== "otro").map(([k, v]) => `<span><i style="background:${col(k)}"></i>${v}</span>`).join("");
   drawMarkers(); fit();
 }
 function renderMapbar() {
-  $("#mapbar").innerHTML = [["all", "Todo"], ...S.days.map(d => [d.id, d.label])].map(([k, l]) => `<button type="button" data-f="${k}" aria-pressed="${k === mapFilter}">${esc(l)}</button>`).join("") + `<button type="button" data-f="fit" aria-pressed="false">Encuadrar</button>`;
+  $("#mapbar").innerHTML = [["all", "Todo"], ...S.days.map(d => [d.id, d.label])].map(([k, l]) => `<button type="button" data-f="${k}" aria-pressed="${k === mapFilter}">${esc(l)}</button>`).join("") + `<button type="button" data-f="near" aria-pressed="false">Cerca de mí</button><button type="button" data-f="fit" aria-pressed="false">Encuadrar</button>`;
+}
+function nearMe() {
+  const list = () => {
+    const ps = S.places.filter(p => p.lat != null).map(p => ({ p, d: haversine(meLL, [p.lat, p.lng]) })).sort((a, b) => a.d - b.d).slice(0, 10);
+    openSheet(`<h2>Cerca de ti</h2><div class="nearlist">${ps.map(({ p, d }) => `<button type="button" data-near="${esc(p.id)}"><i style="background:${col(p.type)}"></i><span><b>${esc(p.name)}</b><small>${esc(TYPES[p.type] || "")}${(p.days || []).length ? " · " + p.days.map(x => esc(DAYN[x] || x)).join(", ") : ""}</small></span><em>${d < 1000 ? Math.round(d / 10) * 10 + " m" : kmTxt(d)}</em></button>`).join("")}</div><p class="small">Distancia en línea recta desde donde estás.</p><div class="actions"><button class="btn ghost" type="button" id="nearClose">Cerrar</button></div>`);
+    $("#nearClose").onclick = closeSheet;
+    $$("#sheet [data-near]").forEach(b => b.onclick = () => { closeSheet(); select(b.dataset.near, true); });
+  };
+  if (meLL && watchId != null) list(); else { toast("Buscando tu ubicación…"); startLocate(list); }
 }
 function drawMarkers() {
   if (!map || !S) return;
@@ -282,7 +296,7 @@ function drawMarkers() {
   Object.values(markers).forEach(m => m.remove()); markers = {}; if (routeLine) { routeLine.remove(); routeLine = null; }
   const order = {}; let pts = [];
   if (mapFilter !== "all") { let n = 0; daySteps(mapFilter).forEach(s => { const p = placeById(s.place_id); if (!p || s.minor) return; n++; (order[p.id] = order[p.id] || []).push(n); if (p.lat != null) pts.push([p.lat, p.lng]); }); }
-  S.places.filter(p => p.lat != null && (mapFilter === "all" || p.days.includes(mapFilter) || order[p.id])).forEach(p => {
+  S.places.filter(p => p.lat != null && (mapFilter === "all" || (p.days || []).includes(mapFilter) || order[p.id])).forEach(p => {
     const lab = order[p.id] ? order[p.id].join("·") : "";
     const m = L.marker([p.lat, p.lng], { icon: L.divIcon({ className: "", html: `<div class="pin${p.id === selId ? " sel" : ""}" style="background:${col(p.type)}"><span>${lab}</span></div>`, iconSize: [28, 28], iconAnchor: [14, 28] }), title: p.name, zIndexOffset: p.id === "hotel" ? 500 : 0, draggable: p.id === dragId });
     m.on("click", e => { L.DomEvent.stopPropagation(e); if (!dragId) select(p.id); });
@@ -290,7 +304,7 @@ function drawMarkers() {
     m.addTo(map); markers[p.id] = m;
   });
   pts = pts.filter((p, i) => !i || p[0] !== pts[i - 1][0] || p[1] !== pts[i - 1][1]);
-  $("#routeInfo").hidden = true;
+  if (!meRoute) $("#routeInfo").hidden = true;
   if (pts.length > 1) {
     const red = getComputedStyle(document.documentElement).getPropertyValue("--fiets").trim() || "#B83A2C";
     // Mientras llega la ruta real se ve una línea discontinua recta.
@@ -304,14 +318,29 @@ function drawMarkers() {
         L.polyline(r.geometry, { color: red, weight: 5, opacity: .95 }),
       ]).addTo(map);
       Object.values(markers).forEach(m => m.setZIndexOffset(100));
-      $("#routeInfo").innerHTML = `<b>${kmTxt(r.distance)}</b> · ${minTxt(r.duration)} pedaleando`;
-      $("#routeInfo").hidden = false;
+      if (!meRoute) { $("#routeInfo").innerHTML = `<b>${kmTxt(r.distance)}</b> · ${minTxt(r.duration)} pedaleando`; $("#routeInfo").hidden = false; }
     }).catch(() => { });
   }
   if (meLL) showMe(meLL, false);
   if (meRoute) meRoute.addTo(map);
 }
 let meRoute = null;
+async function startMove(p) {
+  if (!map) { go("mapa"); await new Promise(r => setTimeout(r, 120)); }
+  $("#card").hidden = true;
+  if (p.lat == null) {
+    // Sin ubicación: se coloca en el centro del mapa y luego se arrastra.
+    const c = map.getCenter();
+    try { await api("savePlace", { place: { id: p.id, lat: c.lat, lng: c.lng } }); await refresh(); } catch (e) { toast("No se pudo colocar: " + e.message); return; }
+    mapFilter = "all";
+  }
+  dragId = p.id; drawMarkers();
+  const m = markers[p.id]; if (m) map.panTo(m.getLatLng());
+  $("#mapHint").innerHTML = 'Arrastra el punto a su sitio <button type="button" class="linkbtn" id="cancelMove">Cancelar</button>';
+  $("#mapHint").hidden = false;
+  $("#cancelMove").onclick = e => { e.stopPropagation(); cancelMove(); };
+}
+function cancelMove() { if (!dragId) return; dragId = null; $("#mapHint").hidden = true; if (map) drawMarkers(); }
 async function routeFromMe(p) {
   const run = async () => {
     try {
@@ -321,7 +350,7 @@ async function routeFromMe(p) {
       map.fitBounds(L.latLngBounds(r.geometry), { padding: [70, 50] });
       $("#routeInfo").innerHTML = `Hasta <b>${esc(p.name)}</b>: <b>${kmTxt(r.distance)}</b> · ${minTxt(r.duration)} <button type="button" class="linkbtn" id="clearMeRoute">Quitar</button>`;
       $("#routeInfo").hidden = false;
-      $("#clearMeRoute").onclick = () => { meRoute.remove(); meRoute = null; drawMarkers(); };
+      $("#clearMeRoute").onclick = () => { meRoute.remove(); meRoute = null; $("#routeInfo").hidden = true; drawMarkers(); };
     } catch (e) { toast("No se pudo calcular la ruta: " + e.message, 4000); }
   };
   if (meLL) return run();
@@ -334,22 +363,23 @@ function select(id, pan) {
   Object.entries(markers).forEach(([k, m]) => { const d = m.getElement()?.querySelector(".pin"); d && d.classList.toggle("sel", k === id); });
   const c = $("#card"); if (!id) { c.hidden = true; return; }
   const p = placeById(id); if (!p) { c.hidden = true; return; }
-  const inSteps = S.steps.filter(s => s.place_id === id).map(s => `${DAYN[s.day] || s.day} ${s.time}`);
+  const inSteps = S.steps.filter(s => s.place_id === id).map(s => esc(`${DAYN[s.day] || s.day} ${s.time}`));
   c.innerHTML = `<button class="close" type="button" aria-label="Cerrar">×</button>
-   <div class="kind" style="color:${col(p.type)}">${TYPES[p.type] || "Otro"}${p.days.length ? " · " + p.days.map(d => DAYN[d] || d).join(", ") : ""}${inSteps.length ? " · Ruta " + inSteps.join(", ") : ""}</div>
+   <div class="kind" style="color:${col(p.type)}">${TYPES[p.type] || "Otro"}${(p.days || []).length ? " · " + p.days.map(d => esc(DAYN[d] || d)).join(", ") : ""}${inSteps.length ? " · Ruta " + inSteps.join(", ") : ""}</div>
    <h3>${esc(p.name)}</h3>${p.address ? `<div class="addr">${esc(p.address)}</div>` : ""}${p.notes ? `<div class="notes">${esc(p.notes)}</div>` : ""}
    <div class="actions"><a class="btn primary" href="${gmGo(p)}" target="_blank" rel="noopener">${ico.go}Ir en bici</a><a class="btn" href="${gmPlace(p)}" target="_blank" rel="noopener">${ico.pin}Google Maps</a></div>
-   <div class="actions"><button class="btn" type="button" data-a="route">${ico.go}Ruta desde aquí</button><button class="btn" type="button" data-a="edit">${ico.edit}Editar</button><button class="btn" type="button" data-a="move">${ico.move}Mover</button><button class="btn" type="button" data-a="ask">${ico.ask}Preguntar</button></div>`;
+   <div class="actions"><button class="btn" type="button" data-a="route">${ico.go}Ruta desde aquí</button><button class="btn" type="button" data-a="addstep">${ico.plus}Añadir a la ruta</button><button class="btn" type="button" data-a="edit">${ico.edit}Editar</button><button class="btn" type="button" data-a="move">${ico.move}Mover</button><button class="btn" type="button" data-a="ask">${ico.ask}Preguntar</button></div>`;
   c.hidden = false;
   $(".close", c).onclick = () => select(null);
   $("[data-a=edit]", c).onclick = () => placeEditor(p);
   $("[data-a=route]", c).onclick = () => { c.hidden = true; routeFromMe(p); };
-  $("[data-a=move]", c).onclick = () => { dragId = p.id; c.hidden = true; drawMarkers(); $("#mapHint").textContent = "Arrastra el punto a su sitio"; $("#mapHint").hidden = false; };
+  $("[data-a=addstep]", c).onclick = () => stepEditor({ day: (mapFilter !== "all" ? mapFilter : curDay) || (p.days || [])[0] || "sab", time: "", title: p.name, km: "", min: "", note: "", minor: false, place_id: p.id });
+  $("[data-a=move]", c).onclick = () => startMove(p);
   $("[data-a=ask]", c).onclick = () => { go("claude"); $("#msg").value = `Sobre ${p.name}: `; $("#msg").focus(); };
-  if (pan) { if (!markers[id]) { mapFilter = "all"; drawMarkers(); } map.setView([p.lat, p.lng], Math.max(map.getZoom(), 15), { animate: true }); }
+  if (pan && p.lat != null) { if (!markers[id]) { mapFilter = "all"; drawMarkers(); } map.setView([p.lat, p.lng], Math.max(map.getZoom(), 15), { animate: true }); }
 }
-$("#mapbar").addEventListener("click", e => { const b = e.target.closest("[data-f]"); if (!b) return; if (b.dataset.f === "fit") { fit(); return; } mapFilter = b.dataset.f; select(null); drawMarkers(); fit(); });
-$("#addPlaceBtn").onclick = () => { const c = map.getCenter(); placeEditor({ name: "", address: "", type: "ver", days: [], notes: "", ...(meLL ? {} : {}) }); };
+$("#mapbar").addEventListener("click", e => { const b = e.target.closest("[data-f]"); if (!b) return; if (b.dataset.f === "fit") { fit(); return; } if (b.dataset.f === "near") { nearMe(); return; } mapFilter = b.dataset.f; select(null); drawMarkers(); fit(); });
+$("#addPlaceBtn").onclick = () => placeEditor({ name: "", address: "", type: "ver", days: curDay ? [curDay] : [], notes: "" });
 function showMe(ll, pan) {
   if (!map) return;
   if (!meMarker) meMarker = L.marker(ll, { icon: L.divIcon({ className: "", html: '<div class="me-dot"></div>', iconSize: [18, 18], iconAnchor: [9, 9] }), zIndexOffset: 1000, interactive: false });
@@ -407,6 +437,19 @@ $("#attachBtn").onclick = () => {
   openSheet(`<h2>Adjuntar documentos</h2><div class="checkrow docpick" style="flex-direction:column">${S.docs.map(d => `<label class="chipradio"><input type="checkbox" value="${d.id}"${attached.includes(d.id) ? " checked" : ""}><span>${esc(d.name)}</span></label>`).join("")}</div><div class="actions"><button class="btn primary" type="button" id="attOk">Listo</button></div>`);
   $("#attOk").onclick = () => { attached = $$("#sheet input:checked").map(i => i.value); closeSheet(); renderAttached(); };
 };
+const QUICK = ["¿Qué toca ahora y cómo llego?", "¿Va a llover hoy?", "¿Qué hay interesante cerca de mí?", "Recalcula los km de la ruta de hoy", "¿Dónde comemos cerca?"];
+function renderQuick() { $("#quick").innerHTML = QUICK.map(q => `<button type="button">${esc(q)}</button>`).join(""); }
+$("#quick").addEventListener("click", e => { const b = e.target.closest("button"); if (!b || busy) return; $("#msg").value = b.textContent; send(); });
+let speakOn = store.get("speak", false);
+function renderSpeak() { $("#speakBtn").setAttribute("aria-pressed", String(speakOn)); $("#speakBtn").setAttribute("aria-label", speakOn ? "Lectura en voz alta activada" : "Lectura en voz alta desactivada"); }
+$("#speakBtn").onclick = () => { speakOn = !speakOn; store.set("speak", speakOn); renderSpeak(); if (!speakOn && window.speechSynthesis) speechSynthesis.cancel(); toast(speakOn ? "Claude leerá las respuestas en voz alta" : "Lectura en voz alta desactivada"); };
+function speak(text) {
+  if (!speakOn || !("speechSynthesis" in window)) return;
+  const plain = text.replace(/\*\*|`/g, "").replace(/\[([^\]]+)\]\([^)]+\)/g, "$1").replace(/https?:\/\/\S+/g, "").slice(0, 900);
+  const u = new SpeechSynthesisUtterance(plain); u.lang = "es-ES"; u.rate = 1.05;
+  const v = speechSynthesis.getVoices().find(v => v.lang && v.lang.startsWith("es")); if (v) u.voice = v;
+  speechSynthesis.cancel(); speechSynthesis.speak(u);
+}
 async function send() {
   const ta = $("#msg"); const text = ta.value.trim(); if (!text || busy) return;
   busy = true; ta.value = ""; autoGrow();
@@ -416,6 +459,7 @@ async function send() {
   try {
     const r = await api("chat", { text, docIds, loc: meLL ? { lat: meLL[0], lng: meLL[1] } : null });
     if (r.changes?.length) toast("Claude ha cambiado la app");
+    if (r.reply) speak(r.reply);
   } catch (e) {
     S.messages.push({ role: "assistant", content: "No he podido responder: " + e.message });
   }
@@ -427,6 +471,7 @@ $("#msg").addEventListener("keydown", e => { if (e.key === "Enter" && !e.shiftKe
 function autoGrow() { const t = $("#msg"); t.style.height = "auto"; t.style.height = Math.min(t.scrollHeight, 140) + "px"; }
 $("#msg").addEventListener("input", autoGrow);
 $("#autoSend").checked = store.get("autoSend", true);
+renderQuick(); renderSpeak();
 $("#autoSend").onchange = e => store.set("autoSend", e.target.checked);
 
 /* Dictado por voz (Web Speech API) */
@@ -443,12 +488,13 @@ function startMic() {
     for (let i = 0; i < e.results.length; i++) { const r = e.results[i]; if (r.isFinal) finalText += r[0].transcript; else interim += r[0].transcript; }
     $("#msg").value = baseText + finalText + interim; autoGrow();
   };
-  rec.onerror = e => { if (e.error === "not-allowed") toast("Sin permiso para el micrófono. Actívalo en los ajustes del navegador.", 4500); else if (e.error !== "no-speech" && e.error !== "aborted") toast("Error del micrófono: " + e.error); };
+  rec.onerror = e => { if (e.error === "service-not-allowed" || e.error === "language-not-supported") { toast("Aquí no se puede dictar. Toca el campo de texto y usa el micrófono del teclado.", 5000); $("#msg").focus(); return; } if (e.error === "not-allowed") toast("Sin permiso para el micrófono. Actívalo en los ajustes del navegador.", 4500); else if (e.error !== "no-speech" && e.error !== "aborted") toast("Error del micrófono: " + e.error); };
   rec.onend = () => { listening = false; $("#micBtn").classList.remove("on"); if (finalText.trim() && $("#autoSend").checked) send(); };
-  rec.start(); listening = true; $("#micBtn").classList.add("on");
+  try { rec.start(); } catch (e) { toast("No se pudo activar el micrófono."); return; }
+  listening = true; $("#micBtn").classList.add("on");
 }
 $("#micBtn").onclick = startMic;
-$("#hdrMic").onclick = () => { go("claude"); setTimeout(startMic, 120); };
+$("#hdrMic").onclick = () => { go("claude"); startMic(); };
 
 /* ---------- Documentos ---------- */
 const fmtSize = b => b > 1e6 ? (b / 1e6).toFixed(1) + " MB" : Math.max(1, Math.round(b / 1e3)) + " KB";
@@ -535,6 +581,7 @@ document.addEventListener("click", e => {
 const TABS = ["ruta", "mapa", "claude", "docs", "viaje"];
 function go(tab) { if (location.hash !== "#" + tab) location.hash = tab; else show(tab); }
 function show(tab) {
+  if (tab !== "mapa" && dragId) cancelMove();
   if (!TABS.includes(tab)) tab = "ruta"; curTab = tab;
   TABS.forEach(t => $("#view-" + t).hidden = t !== tab);
   $$("#tabs a").forEach(a => a.dataset.tab === tab ? a.setAttribute("aria-current", "page") : a.removeAttribute("aria-current"));
@@ -552,7 +599,10 @@ function renderAll() {
 }
 
 /* ---------- Arranque ---------- */
+let started = false;
 function start() {
+  if (started) { refresh(false); return; }
+  started = true;
   tick(); setInterval(() => { tick(); if (curTab === "ruta") markNow(); }, 30000);
   if (S) renderAll();
   show(location.hash.slice(1) || "ruta");
