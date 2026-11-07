@@ -300,7 +300,7 @@ function drawMarkers() {
     const lab = order[p.id] ? order[p.id].join("·") : "";
     const m = L.marker([p.lat, p.lng], { icon: L.divIcon({ className: "", html: `<div class="pin${p.id === selId ? " sel" : ""}" style="background:${col(p.type)}"><span>${lab}</span></div>`, iconSize: [28, 28], iconAnchor: [14, 28] }), title: p.name, zIndexOffset: p.id === "hotel" ? 500 : 0, draggable: p.id === dragId });
     m.on("click", e => { L.DomEvent.stopPropagation(e); if (!dragId) select(p.id); });
-    m.on("dragend", async () => { const ll = m.getLatLng(); dragId = null; $("#mapHint").hidden = true; await act("savePlace", { place: { id: p.id, lat: ll.lat, lng: ll.lng } }, "Ubicación guardada"); select(p.id); });
+    m.on("dragend", async () => { const ll = m.getLatLng(); dragId = null; moveWasEmpty = null; $("#mapHint").hidden = true; try { await act("savePlace", { place: { id: p.id, lat: ll.lat, lng: ll.lng } }, "Ubicación guardada"); select(p.id); } catch { drawMarkers(); } });
     m.addTo(map); markers[p.id] = m;
   });
   pts = pts.filter((p, i) => !i || p[0] !== pts[i - 1][0] || p[1] !== pts[i - 1][1]);
@@ -325,9 +325,11 @@ function drawMarkers() {
   if (meRoute) meRoute.addTo(map);
 }
 let meRoute = null;
+let moveWasEmpty = null;
 async function startMove(p) {
   if (!map) { go("mapa"); await new Promise(r => setTimeout(r, 120)); }
-  $("#card").hidden = true;
+  select(null);
+  moveWasEmpty = p.lat == null ? p.id : null;
   if (p.lat == null) {
     // Sin ubicación: se coloca en el centro del mapa y luego se arrastra.
     const c = map.getCenter();
@@ -340,7 +342,13 @@ async function startMove(p) {
   $("#mapHint").hidden = false;
   $("#cancelMove").onclick = e => { e.stopPropagation(); cancelMove(); };
 }
-function cancelMove() { if (!dragId) return; dragId = null; $("#mapHint").hidden = true; if (map) drawMarkers(); }
+function cancelMove() {
+  if (!dragId) return;
+  const undo = moveWasEmpty === dragId ? dragId : null;
+  dragId = null; moveWasEmpty = null; $("#mapHint").hidden = true;
+  if (undo) act("savePlace", { place: { id: undo, lat: null, lng: null } }).catch(() => { });
+  else if (map) drawMarkers();
+}
 async function routeFromMe(p) {
   const run = async () => {
     try {
@@ -442,7 +450,7 @@ function renderQuick() { $("#quick").innerHTML = QUICK.map(q => `<button type="b
 $("#quick").addEventListener("click", e => { const b = e.target.closest("button"); if (!b || busy) return; $("#msg").value = b.textContent; send(); });
 let speakOn = store.get("speak", false);
 function renderSpeak() { $("#speakBtn").setAttribute("aria-pressed", String(speakOn)); $("#speakBtn").setAttribute("aria-label", speakOn ? "Lectura en voz alta activada" : "Lectura en voz alta desactivada"); }
-$("#speakBtn").onclick = () => { speakOn = !speakOn; store.set("speak", speakOn); renderSpeak(); if (!speakOn && window.speechSynthesis) speechSynthesis.cancel(); toast(speakOn ? "Claude leerá las respuestas en voz alta" : "Lectura en voz alta desactivada"); };
+$("#speakBtn").onclick = () => { if (!speakOn && window.speechSynthesis) { try { speechSynthesis.speak(new SpeechSynthesisUtterance("")); } catch { } } speakOn = !speakOn; store.set("speak", speakOn); renderSpeak(); if (!speakOn && window.speechSynthesis) speechSynthesis.cancel(); toast(speakOn ? "Claude leerá las respuestas en voz alta" : "Lectura en voz alta desactivada"); };
 function speak(text) {
   if (!speakOn || !("speechSynthesis" in window)) return;
   const plain = text.replace(/\*\*|`/g, "").replace(/\[([^\]]+)\]\([^)]+\)/g, "$1").replace(/https?:\/\/\S+/g, "").slice(0, 900);
@@ -452,19 +460,24 @@ function speak(text) {
 }
 async function send() {
   const ta = $("#msg"); const text = ta.value.trim(); if (!text || busy) return;
+  if (!S) { toast("Cargando datos… prueba en unos segundos."); return; }
   busy = true; ta.value = ""; autoGrow();
   const docIds = attached; attached = []; renderAttached();
   S.messages = [...(S.messages || []), { role: "user", author: who, content: text, meta: docIds.length ? { docs: docIds } : null }];
   renderChat(); $("#sendBtn").disabled = true;
+  let failed = null;
   try {
     const r = await api("chat", { text, docIds, loc: meLL ? { lat: meLL[0], lng: meLL[1] } : null });
     if (r.changes?.length) toast("Claude ha cambiado la app");
     if (r.reply) speak(r.reply);
   } catch (e) {
-    S.messages.push({ role: "assistant", content: "No he podido responder: " + e.message });
+    failed = [{ role: "user", author: who, content: text }, { role: "assistant", content: "No he podido responder: " + e.message + ". Tu mensaje está arriba: vuelve a enviarlo cuando haya conexión." }];
+  } finally {
+    busy = false; $("#sendBtn").disabled = false;
   }
-  busy = false; $("#sendBtn").disabled = false;
-  await refresh(); renderChat();
+  await refresh();
+  if (failed && S) { const last = (S.messages || []).slice(-1)[0]; if (!last || last.content !== text) S.messages = [...(S.messages || []), ...failed]; else S.messages = [...S.messages, failed[1]]; }
+  renderChat();
 }
 $("#sendBtn").onclick = send;
 $("#msg").addEventListener("keydown", e => { if (e.key === "Enter" && !e.shiftKey && !("ontouchstart" in window)) { e.preventDefault(); send(); } });
