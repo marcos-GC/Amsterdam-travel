@@ -1,0 +1,398 @@
+// API de la guía de Ámsterdam: datos compartidos, documentos y chat con Claude.
+// Todas las peticiones llevan la cabecera x-trip-code, que se compara con el secreto TRIP_CODE.
+import "jsr:@supabase/functions-js/edge-runtime.d.ts";
+import { createClient } from "npm:@supabase/supabase-js@2.45.4";
+import Anthropic from "npm:@anthropic-ai/sdk@1.3.0";
+
+const db = createClient(Deno.env.get("SUPABASE_URL")!, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!);
+const TRIP_CODE = Deno.env.get("TRIP_CODE") ?? "";
+const MODEL = "claude-opus-5-5";
+const TYPES = ["ver", "comer", "diseno", "bici", "base", "ferri", "otro"];
+
+const cors = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Headers": "authorization, apikey, content-type, x-trip-code, x-client-info",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+};
+const json = (body: unknown, status = 200) =>
+  new Response(JSON.stringify(body), { status, headers: { ...cors, "Content-Type": "application/json" } });
+
+function safeEqual(a: string, b: string) {
+  if (!a || !b || a.length !== b.length) return false;
+  let r = 0;
+  for (let i = 0; i < a.length; i++) r |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return r === 0;
+}
+
+async function must<T>(p: PromiseLike<{ data: T; error: unknown }>): Promise<T> {
+  const { data, error } = await p;
+  if (error) throw new Error((error as { message?: string }).message ?? String(error));
+  return data;
+}
+
+// ---------- Datos ----------
+async function getState(withMessages = true) {
+  const [places, days, steps, checks, info, docs] = await Promise.all([
+    must(db.from("places").select("*").order("name")),
+    must(db.from("days").select("*").order("sort")),
+    must(db.from("steps").select("*").order("time")),
+    must(db.from("checks").select("*").order("sort")),
+    must(db.from("info").select("*").order("sort")),
+    must(db.from("docs").select("*").order("created_at", { ascending: false })),
+  ]);
+  const out: Record<string, unknown> = { places, days, steps, checks, info, docs };
+  if (withMessages) {
+    const msgs = await must(db.from("messages").select("*").order("id", { ascending: false }).limit(60));
+    out.messages = (msgs as unknown[]).reverse();
+  }
+  return out;
+}
+
+function pick(o: Record<string, unknown>, keys: string[]) {
+  const r: Record<string, unknown> = {};
+  for (const k of keys) if (o[k] !== undefined) r[k] = o[k];
+  return r;
+}
+
+function slug(s: string) {
+  return s.toLowerCase().normalize("NFD").replace(/[̀-ͯ]/g, "").replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 40) || "sitio";
+}
+
+async function geocode(q: string) {
+  const u = "https://nominatim.openstreetmap.org/search?" + new URLSearchParams({ q, format: "jsonv2", limit: "3", viewbox: "4.72,52.43,5.08,52.30", bounded: "0" });
+  const r = await fetch(u, { headers: { "User-Agent": "amsterdam-travel-guide/1.0 (personal trip app)" } });
+  if (!r.ok) throw new Error("El buscador de direcciones no responde (" + r.status + ")");
+  const list = await r.json();
+  return (list as { lat: string; lon: string; display_name: string }[]).map((x) => ({ lat: +x.lat, lng: +x.lon, label: x.display_name }));
+}
+
+async function savePlace(p: Record<string, unknown>, who: string) {
+  const row = pick(p, ["id", "name", "address", "type", "days", "lat", "lng", "notes"]);
+  if (row.type && !TYPES.includes(String(row.type))) row.type = "otro";
+  if (!row.id) {
+    if (!row.name) throw new Error("Falta el nombre del sitio");
+    let id = slug(String(row.name));
+    const exists = await must(db.from("places").select("id").eq("id", id));
+    if ((exists as unknown[]).length) id += "-" + Math.random().toString(36).slice(2, 6);
+    row.id = id;
+  }
+  if ((row.lat == null || row.lng == null) && row.address && !p.id) {
+    try {
+      const g = await geocode(String(row.address).includes("Amsterdam") ? String(row.address) : row.address + ", Amsterdam");
+      if (g[0]) { row.lat = g[0].lat; row.lng = g[0].lng; }
+    } catch (_) { /* se guarda sin coordenadas */ }
+  }
+  row.updated_by = who;
+  row.updated_at = new Date().toISOString();
+  return await must(db.from("places").upsert(row).select().single());
+}
+
+async function saveStep(s: Record<string, unknown>, who: string) {
+  const row = pick(s, ["id", "day", "time", "place_id", "title", "km", "min", "note", "minor"]);
+  if (row.place_id === "") row.place_id = null;
+  row.updated_by = who;
+  row.updated_at = new Date().toISOString();
+  return await must(db.from("steps").upsert(row).select().single());
+}
+
+async function saveInfo(i: Record<string, unknown>, who: string) {
+  const row = pick(i, ["id", "title", "body", "sort"]);
+  if (!row.id) row.id = slug(String(row.title ?? "nota")) + "-" + Math.random().toString(36).slice(2, 5);
+  row.updated_by = who;
+  row.updated_at = new Date().toISOString();
+  return await must(db.from("info").upsert(row).select().single());
+}
+
+async function signedDocs(docs: { id: string; path: string }[]) {
+  if (!docs.length) return {};
+  const { data } = await db.storage.from("docs").createSignedUrls(docs.map((d) => d.path), 60 * 60 * 6);
+  const m: Record<string, string> = {};
+  (data ?? []).forEach((x, i) => { if (x.signedUrl) m[docs[i].id] = x.signedUrl; });
+  return m;
+}
+
+function toBase64(buf: ArrayBuffer) {
+  const bytes = new Uint8Array(buf);
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  return btoa(bin);
+}
+
+async function docBlock(id: string) {
+  const d = await must(db.from("docs").select("*").eq("id", id).single()) as { name: string; path: string; mime: string; note: string };
+  const { data, error } = await db.storage.from("docs").download(d.path);
+  if (error || !data) throw new Error("No se pudo leer el documento");
+  const buf = await data.arrayBuffer();
+  if (d.mime === "application/pdf") {
+    return { type: "document", source: { type: "base64", media_type: "application/pdf", data: toBase64(buf) }, title: d.name };
+  }
+  if (/^image\/(jpeg|png|gif|webp)$/.test(d.mime)) {
+    return { type: "image", source: { type: "base64", media_type: d.mime, data: toBase64(buf) } };
+  }
+  if (d.mime.startsWith("text/") || d.mime === "application/json") {
+    return { type: "document", source: { type: "text", media_type: "text/plain", data: new TextDecoder().decode(buf) }, title: d.name };
+  }
+  return { type: "text", text: `El documento «${d.name}» es de tipo ${d.mime} y no se puede leer.` };
+}
+
+// ---------- Claude ----------
+const TOOLS = [
+  {
+    name: "guardar_sitio",
+    description: "Crea un sitio nuevo en el mapa o modifica uno existente (pasa su id para modificarlo; solo hace falta enviar los campos que cambian). Si creas un sitio sin lat/lng se busca la dirección automáticamente; mejor llama antes a buscar_direccion si dudas.",
+    input_schema: {
+      type: "object",
+      properties: {
+        id: { type: "string", description: "Id del sitio a modificar. Omítelo para crear uno nuevo." },
+        name: { type: "string" },
+        address: { type: "string" },
+        type: { type: "string", enum: TYPES },
+        days: { type: "array", items: { type: "string", enum: ["sab", "dom", "lun"] }, description: "Días del viaje en que encaja el sitio." },
+        lat: { type: "number" },
+        lng: { type: "number" },
+        notes: { type: "string", description: "Horario, precio, por qué merece la pena, etc." },
+      },
+    },
+  },
+  { name: "borrar_sitio", description: "Borra un sitio del mapa. Las paradas del itinerario que lo usaban se quedan sin sitio asociado.", input_schema: { type: "object", properties: { id: { type: "string" } }, required: ["id"] } },
+  {
+    name: "guardar_parada",
+    description: "Crea o modifica una parada del itinerario de un día (pasa su id para modificarla). La hora va en formato H:MM. km y min son el tramo en bici desde la parada anterior. minor=true para pasos sin bici (vuelos, bus).",
+    input_schema: {
+      type: "object",
+      properties: {
+        id: { type: "string" },
+        day: { type: "string", enum: ["sab", "dom", "lun"] },
+        time: { type: "string" },
+        place_id: { type: "string", description: "Id del sitio del mapa, o cadena vacía si no hay." },
+        title: { type: "string" },
+        km: { type: "string" },
+        min: { type: "string" },
+        note: { type: "string" },
+        minor: { type: "boolean" },
+      },
+    },
+  },
+  { name: "borrar_parada", description: "Borra una parada del itinerario.", input_schema: { type: "object", properties: { id: { type: "string" } }, required: ["id"] } },
+  {
+    name: "guardar_dia",
+    description: "Cambia el título, subtítulo, kilómetros, aviso de luz o la nota de un día.",
+    input_schema: { type: "object", properties: { id: { type: "string", enum: ["sab", "dom", "lun"] }, title: { type: "string" }, sub: { type: "string" }, km: { type: "string" }, light: { type: "string" }, note: { type: "string" } }, required: ["id"] },
+  },
+  {
+    name: "guardar_info",
+    description: "Crea o modifica una ficha de la pestaña Viaje (vuelos, hotel, normas, notas...). El cuerpo admite **negrita**, listas con '- ' y `código` (se puede copiar con un toque).",
+    input_schema: { type: "object", properties: { id: { type: "string" }, title: { type: "string" }, body: { type: "string" } } },
+  },
+  {
+    name: "guardar_pendiente",
+    description: "Añade un pendiente a la lista, o marca/desmarca uno existente (pasa su id).",
+    input_schema: { type: "object", properties: { id: { type: "string" }, label: { type: "string" }, done: { type: "boolean" } } },
+  },
+  { name: "buscar_direccion", description: "Busca una dirección o un lugar de Ámsterdam en OpenStreetMap y devuelve coordenadas.", input_schema: { type: "object", properties: { q: { type: "string" } }, required: ["q"] } },
+  { name: "leer_documento", description: "Lee un documento subido por los viajeros (PDF, imagen o texto) por su id.", input_schema: { type: "object", properties: { id: { type: "string" } }, required: ["id"] } },
+];
+
+const SYSTEM = `Eres el asistente de la guía de viaje de Marcos e Isabel: dos días y medio en bici por Ámsterdam, del sábado 7 al lunes 9 de noviembre de 2026, con base en el hotel Catalonia Vondel (Oud-West). Les interesan la arquitectura y el diseño.
+
+Te escriben desde el móvil, a menudo dictando por voz mientras van en bici, así que el texto puede tener errores de transcripción. Responde en español, breve y directo: unas pocas frases o una lista corta. Nada de saludos ni de repetir la pregunta.
+
+Puedes cambiar la app con las herramientas: sitios del mapa, paradas del itinerario, días, fichas de información y pendientes. Cuando te pidan añadir, quitar o cambiar algo, hazlo directamente y después di en una frase qué has cambiado. Si una petición es ambigua y equivocarse costaría (por ejemplo, borrar varias paradas), pregunta antes. Al mover una parada a otra hora, revisa si hay que reajustar las siguientes y dilo.
+
+Usa la búsqueda web cuando necesites datos actuales (horarios, si algo abre hoy, precios, eventos) y di de dónde sale el dato. Si no puedes comprobar algo, dilo.
+
+Los datos actuales de la app van en el primer mensaje de cada conversación, entre etiquetas <datos_app>. Usa los ids que aparecen ahí. La hora local de Ámsterdam va en cada mensaje.`;
+
+type Change = { what: string };
+
+async function runTool(name: string, input: Record<string, unknown>, who: string, changes: Change[]): Promise<unknown> {
+  switch (name) {
+    case "guardar_sitio": {
+      const r = await savePlace(input, "Claude (" + who + ")") as { id: string; name: string };
+      changes.push({ what: (input.id ? "Sitio modificado: " : "Sitio añadido: ") + r.name });
+      return r;
+    }
+    case "borrar_sitio": {
+      await must(db.from("places").delete().eq("id", String(input.id)));
+      changes.push({ what: "Sitio borrado: " + input.id });
+      return { ok: true };
+    }
+    case "guardar_parada": {
+      const r = await saveStep(input, "Claude (" + who + ")") as { title: string };
+      changes.push({ what: (input.id ? "Parada modificada: " : "Parada añadida: ") + r.title });
+      return r;
+    }
+    case "borrar_parada": {
+      await must(db.from("steps").delete().eq("id", String(input.id)));
+      changes.push({ what: "Parada borrada" });
+      return { ok: true };
+    }
+    case "guardar_dia": {
+      const row = pick(input, ["title", "sub", "km", "light", "note"]);
+      const r = await must(db.from("days").update(row).eq("id", String(input.id)).select().single());
+      changes.push({ what: "Día modificado: " + input.id });
+      return r;
+    }
+    case "guardar_info": {
+      const r = await saveInfo(input, "Claude (" + who + ")") as { title: string };
+      changes.push({ what: "Ficha guardada: " + r.title });
+      return r;
+    }
+    case "guardar_pendiente": {
+      const row = pick(input, ["id", "label", "done"]);
+      if (!row.id && !row.label) throw new Error("Falta el texto del pendiente");
+      if (!row.id) row.sort = 100;
+      const r = await must(db.from("checks").upsert(row).select().single());
+      changes.push({ what: "Pendiente actualizado" });
+      return r;
+    }
+    case "buscar_direccion":
+      return await geocode(String(input.q));
+    case "leer_documento":
+      return [await docBlock(String(input.id))];
+  }
+  throw new Error("Herramienta desconocida: " + name);
+}
+
+function amsNow() {
+  return new Intl.DateTimeFormat("es-ES", { timeZone: "Europe/Amsterdam", weekday: "long", day: "numeric", month: "long", hour: "2-digit", minute: "2-digit" }).format(new Date());
+}
+
+async function chat(text: string, who: string, docIds: string[], loc: { lat: number; lng: number } | null) {
+  const apiKey = Deno.env.get("ANTHROPIC_API_KEY");
+  if (!apiKey) throw new Error("Falta la clave de la API de Anthropic en el servidor (secreto ANTHROPIC_API_KEY).");
+  const client = new Anthropic({ apiKey });
+
+  await must(db.from("messages").insert({ author: who, role: "user", content: text, meta: docIds.length ? { docs: docIds } : null }));
+
+  // Historial reciente como texto (sin bloques de razonamiento de turnos anteriores).
+  const hist = (await must(db.from("messages").select("role,author,content").order("id", { ascending: false }).limit(16)) as { role: string; author: string; content: string }[]).reverse();
+  hist.pop(); // el mensaje actual va aparte
+  while (hist.length && hist[0].role !== "user") hist.shift();
+  const messages: Anthropic.Beta.BetaMessageParam[] = [];
+  for (const m of hist) {
+    const content = m.role === "user" ? `[${m.author ?? "?"}] ${m.content}` : m.content;
+    const last = messages[messages.length - 1];
+    if (last && last.role === m.role) last.content = (last.content as string) + "\n\n" + content;
+    else messages.push({ role: m.role as "user" | "assistant", content });
+  }
+
+  const state = await getState(false) as { docs: { id: string; name: string; mime: string; note: string }[] };
+  const dataBlock = `<datos_app>\n${JSON.stringify(state)}\n</datos_app>`;
+  const userContent: Anthropic.Beta.BetaContentBlockParam[] = [];
+  for (const id of docIds) userContent.push(await docBlock(id) as Anthropic.Beta.BetaContentBlockParam);
+  const where = loc ? ` Ubicación aproximada: ${loc.lat.toFixed(5)}, ${loc.lng.toFixed(5)}.` : "";
+  userContent.push({ type: "text", text: `[${who} · ${amsNow()}.${where}]\n${text}` });
+
+  // Los datos de la app van al principio de la conversación para no romper la caché del historial.
+  if (messages.length && messages[0].role === "user") {
+    messages[0].content = dataBlock + "\n\n" + (messages[0].content as string);
+    messages.push({ role: "user", content: userContent });
+  } else {
+    messages.push({ role: "user", content: [{ type: "text", text: dataBlock }, ...userContent] });
+  }
+
+  const changes: Change[] = [];
+  let reply = "";
+  for (let turn = 0; turn < 8; turn++) {
+    const res = await client.beta.messages.create({
+      model: MODEL,
+      max_tokens: 16000,
+      system: SYSTEM,
+      thinking: { type: "adaptive" },
+      output_config: { effort: "low" },
+      tools: [...TOOLS, { type: "web_search_20260209", name: "web_search", max_uses: 3 }],
+      messages,
+      betas: ["server-side-fallback-2026-07-01"],
+      fallbacks: "default",
+    } as unknown as Anthropic.Beta.MessageCreateParamsNonStreaming);
+
+    if (res.stop_reason === "refusal") { reply = "No puedo ayudar con eso."; break; }
+    messages.push({ role: "assistant", content: res.content as Anthropic.Beta.BetaContentBlockParam[] });
+    const texts = res.content.filter((b) => b.type === "text").map((b) => (b as { text: string }).text);
+    if (texts.length) reply = texts.join("\n").trim();
+
+    if (res.stop_reason === "pause_turn") continue;
+    if (res.stop_reason !== "tool_use") break;
+
+    const results: Anthropic.Beta.BetaToolResultBlockParam[] = [];
+    for (const b of res.content) {
+      if (b.type !== "tool_use") continue;
+      try {
+        const out = await runTool(b.name, b.input as Record<string, unknown>, who, changes);
+        results.push({ type: "tool_result", tool_use_id: b.id, content: Array.isArray(out) ? out as Anthropic.Beta.BetaToolResultBlockParam["content"] : JSON.stringify(out) });
+      } catch (e) {
+        results.push({ type: "tool_result", tool_use_id: b.id, content: String((e as Error).message ?? e), is_error: true });
+      }
+    }
+    messages.push({ role: "user", content: results });
+  }
+  if (!reply) reply = changes.length ? "Hecho." : "No he podido generar una respuesta.";
+  await must(db.from("messages").insert({ author: "Claude", role: "assistant", content: reply, meta: changes.length ? { changes } : null }));
+  return { reply, changes };
+}
+
+// ---------- Rutas ----------
+Deno.serve(async (req) => {
+  if (req.method === "OPTIONS") return new Response("ok", { headers: cors });
+  if (req.method !== "POST") return json({ error: "Método no permitido" }, 405);
+  if (!TRIP_CODE) return json({ error: "El servidor no tiene código de acceso configurado (secreto TRIP_CODE)." }, 500);
+  if (!safeEqual(req.headers.get("x-trip-code") ?? "", TRIP_CODE)) return json({ error: "Código incorrecto" }, 401);
+
+  let body: Record<string, unknown>;
+  try { body = await req.json(); } catch { return json({ error: "Petición no válida" }, 400); }
+  const who = String(body.who ?? "Alguien").slice(0, 40);
+
+  try {
+    switch (body.action) {
+      case "ping": return json({ ok: true });
+      case "state": {
+        const s = await getState() as { docs: { id: string; path: string }[] };
+        return json({ ...s, docUrls: await signedDocs(s.docs) });
+      }
+      case "savePlace": return json(await savePlace(body.place as Record<string, unknown>, who));
+      case "deletePlace": await must(db.from("places").delete().eq("id", String(body.id))); return json({ ok: true });
+      case "saveStep": return json(await saveStep(body.step as Record<string, unknown>, who));
+      case "deleteStep": await must(db.from("steps").delete().eq("id", String(body.id))); return json({ ok: true });
+      case "saveInfo": return json(await saveInfo(body.info as Record<string, unknown>, who));
+      case "deleteInfo": await must(db.from("info").delete().eq("id", String(body.id))); return json({ ok: true });
+      case "saveCheck": {
+        const row = pick(body.check as Record<string, unknown>, ["id", "label", "done", "sort"]);
+        row.updated_by = who;
+        return json(await must(db.from("checks").upsert(row).select().single()));
+      }
+      case "deleteCheck": await must(db.from("checks").delete().eq("id", String(body.id))); return json({ ok: true });
+      case "geocode": return json(await geocode(String(body.q)));
+      case "uploadUrl": {
+        const name = String(body.name ?? "archivo").replace(/[^\w.\-]+/g, "_").slice(-80);
+        const path = `${crypto.randomUUID()}/${name}`;
+        const { data, error } = await db.storage.from("docs").createSignedUploadUrl(path);
+        if (error) throw error;
+        return json({ path, token: data.token, signedUrl: data.signedUrl });
+      }
+      case "registerDoc": {
+        const row = pick(body.doc as Record<string, unknown>, ["name", "path", "mime", "size", "note"]);
+        row.created_by = who;
+        return json(await must(db.from("docs").insert(row).select().single()));
+      }
+      case "deleteDoc": {
+        const d = await must(db.from("docs").select("path").eq("id", String(body.id)).single()) as { path: string };
+        await db.storage.from("docs").remove([d.path]);
+        await must(db.from("docs").delete().eq("id", String(body.id)));
+        return json({ ok: true });
+      }
+      case "chat": {
+        const text = String(body.text ?? "").trim();
+        if (!text) return json({ error: "Mensaje vacío" }, 400);
+        const docIds = Array.isArray(body.docIds) ? (body.docIds as string[]).slice(0, 5) : [];
+        const loc = body.loc && typeof (body.loc as { lat: number }).lat === "number" ? body.loc as { lat: number; lng: number } : null;
+        return json(await chat(text.slice(0, 4000), who, docIds, loc));
+      }
+      case "clearChat": await must(db.from("messages").delete().gte("id", 0)); return json({ ok: true });
+    }
+    return json({ error: "Acción desconocida" }, 400);
+  } catch (e) {
+    console.error(e);
+    return json({ error: String((e as Error).message ?? e) }, 500);
+  }
+});
